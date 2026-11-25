@@ -69,14 +69,29 @@ func (m *model) ensureVisible() {
 
 // resize pushes the current terminal size into the text widgets.
 func (m *model) resize() {
-	leftW, rightW, mainH := m.dims()
+	leftW, _, _ := m.dims()
 	m.search.Width = clamp(leftW-7, 5, 500)
+	mw, noteH := m.modalDims()
 	for i := range m.inputs {
-		m.inputs[i].Width = clamp(rightW-8, 5, 500)
+		m.inputs[i].Width = clamp(mw-8, 5, 500)
 	}
-	m.note.SetWidth(clamp(rightW-4, 10, 500))
-	m.note.SetHeight(clamp(mainH-2-13, 3, 500))
+	m.note.SetWidth(clamp(mw-4, 10, 500))
+	m.note.SetHeight(noteH)
 	m.ensureVisible()
+}
+
+// modalFixedH is the task modal's height without the note editor: borders,
+// padding, the form's fields and the hint line.
+const modalFixedH = 17
+
+// modalDims returns the task modal's width and the note editor's height.
+func (m *model) modalDims() (w, noteH int) {
+	w = clamp(m.width*55/100, 60, 84)
+	if w > m.width-4 {
+		w = m.width - 4
+	}
+	noteH = clamp(m.height-2-modalFixedH, 1, 8)
+	return w, noteH
 }
 
 // ---------------------------------------------------------------- view ---
@@ -94,7 +109,9 @@ func (m *model) View() string {
 	switch {
 	case m.mode == modeSearch:
 		searchCol = colAccent
-	case m.mode == modePicker || m.mode == modeForm || m.focus == paneDetails:
+	case m.mode == modeForm:
+		// the modal has the focus; leave both panes unhighlighted
+	case m.mode == modePicker || m.focus == paneDetails:
 		rightCol = colAccent
 	default:
 		listCol = colAccent
@@ -114,12 +131,6 @@ func (m *model) View() string {
 			rightTitle = "Filter: projects"
 		}
 		rightBody = m.pickerView()
-	case modeForm:
-		rightTitle = "Edit task"
-		if m.editID == 0 {
-			rightTitle = "New task"
-		}
-		rightBody = m.formView()
 	default:
 		rightTitle = "Details"
 		rightBody = m.detailsView(rightW-2, mainH-2)
@@ -137,7 +148,48 @@ func (m *model) View() string {
 		footer[i] = ansi.Truncate(l, m.width, "…")
 	}
 
-	return top + "\n" + main + "\n" + strings.Join(footer, "\n")
+	screen := top + "\n" + main + "\n" + strings.Join(footer, "\n")
+	if m.mode == modeForm {
+		screen = m.withModal(screen)
+	}
+	return screen
+}
+
+// withModal dims the screen and draws the task form centered on top of it.
+func (m *model) withModal(screen string) string {
+	title := " Edit task "
+	if m.editID == 0 {
+		title = " New task "
+	}
+	w, noteH := m.modalDims()
+	h := modalFixedH + noteH
+	hint := styAccent.Render("tab") + styDim.Render(" next field  ") +
+		styAccent.Render("ctrl+s") + styDim.Render(" save  ") +
+		styAccent.Render("esc") + styDim.Render(" cancel")
+	body := "\n" + m.formView() + "\n\n " + hint
+	modal := box(title, body, w, h, colAccent)
+
+	bg := strings.Split(screen, "\n")
+	for i, l := range bg {
+		bg[i] = styDim.Render(ansi.Strip(l))
+	}
+	x := (m.width - w) / 2
+	y := (m.height - h) / 2
+	if y < 0 {
+		y = 0
+	}
+	for i, line := range strings.Split(modal, "\n") {
+		row := y + i
+		if row >= len(bg) {
+			break
+		}
+		base := bg[row]
+		left := ansi.Truncate(base, x, "")
+		left += strings.Repeat(" ", x-lipgloss.Width(left))
+		right := ansi.TruncateLeft(base, x+w, "")
+		bg[row] = left + line + right
+	}
+	return strings.Join(bg, "\n")
 }
 
 func (m *model) filterSummary() string {
