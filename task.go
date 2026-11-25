@@ -26,8 +26,13 @@ type Task struct {
 type Store struct {
 	path     string
 	donePath string // archive file for completed tasks
-	NextID   int    `json:"next_id"`
-	Tasks    []Task `json:"tasks"`
+
+	// Change tracking, so tasks added from the command line while the TUI is
+	// open are picked up rather than overwritten.
+	modTime  time.Time // tasks file mtime when last read or written
+	loadedID int       // NextID when last read from disk
+	NextID   int       `json:"next_id"`
+	Tasks    []Task    `json:"tasks"`
 }
 
 func LoadStore(path, donePath string) (*Store, error) {
@@ -42,12 +47,67 @@ func LoadStore(path, donePath string) (*Store, error) {
 	if err := json.Unmarshal(data, s); err != nil {
 		return nil, err
 	}
+	s.fixNextID()
+	s.loadedID = s.NextID
+	s.modTime = fileModTime(path)
+	return s, nil
+}
+
+func (s *Store) fixNextID() {
 	for _, t := range s.Tasks {
 		if t.ID >= s.NextID {
 			s.NextID = t.ID + 1
 		}
 	}
-	return s, nil
+}
+
+func fileModTime(path string) time.Time {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.ModTime()
+	}
+	return time.Time{}
+}
+
+// Changed reports whether another process wrote the tasks file since this
+// store last read or wrote it.
+func (s *Store) Changed() bool {
+	return s.path != "" && !fileModTime(s.path).Equal(s.modTime)
+}
+
+// Reload replaces the in-memory tasks with the file's contents.
+func (s *Store) Reload() error {
+	fresh, err := LoadStore(s.path, s.donePath)
+	if err != nil {
+		return err
+	}
+	s.NextID, s.Tasks, s.modTime, s.loadedID = fresh.NextID, fresh.Tasks, fresh.modTime, fresh.loadedID
+	return nil
+}
+
+// mergeExternal folds in tasks another process (gsd add) created after this
+// store last loaded, so saving does not wipe them. Tasks it knew about are
+// left as they are in memory, so local edits and deletions win.
+func (s *Store) mergeExternal() error {
+	disk, err := LoadStore(s.path, s.donePath)
+	if err != nil {
+		return err
+	}
+	have := map[int]bool{}
+	for _, t := range s.Tasks {
+		have[t.ID] = true
+	}
+	for _, t := range disk.Tasks {
+		if t.ID < s.loadedID {
+			continue // existed when we loaded: our copy (or its deletion) wins
+		}
+		if have[t.ID] {
+			t.ID = s.NextID // both sides created a task with this ID
+		}
+		s.Tasks = append(s.Tasks, t)
+		have[t.ID] = true
+		s.fixNextID()
+	}
+	return nil
 }
 
 // Save writes atomically: temp file in the same directory, then rename.
@@ -55,7 +115,17 @@ func (s *Store) Save() error {
 	if s.path == "" {
 		return nil
 	}
-	return writeJSON(s.path, s)
+	if s.Changed() {
+		if err := s.mergeExternal(); err != nil {
+			return err
+		}
+	}
+	if err := writeJSON(s.path, s); err != nil {
+		return err
+	}
+	s.modTime = fileModTime(s.path)
+	s.loadedID = s.NextID
+	return nil
 }
 
 func writeJSON(path string, v any) error {

@@ -134,7 +134,43 @@ func newModel(store *Store) *model {
 	return m
 }
 
-func (m *model) Init() tea.Cmd { return nil }
+// reloadTick is how often the TUI checks the tasks file for changes made by
+// "gsd add" in another terminal.
+type reloadTick struct{}
+
+func pollReload() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return reloadTick{} })
+}
+
+func (m *model) Init() tea.Cmd { return pollReload() }
+
+// reloadIfChanged picks up external changes, except while a form or delete
+// confirmation is open (they refer to the current tasks; saving merges).
+func (m *model) reloadIfChanged() {
+	if m.mode == modeForm || m.mode == modeConfirm || !m.store.Changed() {
+		return
+	}
+	selID := 0
+	if t := m.selected(); t != nil {
+		selID = t.ID
+	}
+	before := len(m.store.Tasks)
+	if err := m.store.Reload(); err != nil {
+		m.status = "Reload failed: " + err.Error()
+		return
+	}
+	m.visible = nil // indexes are stale
+	m.refresh()
+	m.selectID(selID)
+	if m.mode == modePicker {
+		m.pickItems, m.pickCounts = m.distinct(m.pickKind)
+		m.pickCursor = clamp(m.pickCursor, 0, len(m.pickItems)-1)
+	}
+	m.ensureVisible()
+	if n := len(m.store.Tasks) - before; n > 0 {
+		m.status = fmt.Sprintf("%d new task(s) added from the command line", n)
+	}
+}
 
 // ---------------------------------------------------------------- data ---
 
@@ -286,6 +322,10 @@ func (m *model) persist() {
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case reloadTick:
+		m.reloadIfChanged()
+		return m, pollReload()
+
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.resize()
